@@ -332,3 +332,67 @@ yamllint -d relaxed .github/workflows/cicd.yml devops-tp12/values-prod.yaml
 | deploy-k8s-helm | Publicación y despliegue | — | Fallo real de deploy; omisión explícita si faltan credenciales | Publica/despliega la imagen ya construida | Resumen del job |
 
 V2: exigir los checks de estado mediante branch protection; fijar todas las Actions a SHA; mantener DB de Trivy cacheada; generar SBOM; hacer findings informativos accionables; versionar la imagen frontend; evaluar runner reproducible y agregar kube-state-metrics/autenticación instrumentada para completar las alertas TP12C.
+
+# TP17 — Detección de secretos con Gitleaks
+
+Gitleaks 8.30.0 se integra en el mismo pipeline con la configuración explícita
+`.gitleaks.toml`. Se conservan sus reglas por defecto y las dos excepciones
+específicas existentes; no se agrega baseline JSON ni nuevas excepciones.
+
+- `gitleaks-andon-cord` no depende del build ni de Trivy. Hace checkout con
+  `fetch-depth: 0`, usa `gitleaks/gitleaks-action@v3` y bloquea al detectar un
+  secreto o un error operativo. La Action escanea los commits del evento en
+  push/PR; un paso obligatorio con CLI y `--log-opts=--all` verifica además todo
+  el historial disponible. Se fija `GITLEAKS_VERSION: 8.30.0`.
+- `gitleaks-audit-report` depende sólo del Andon Gitleaks y usa `always()`.
+  Instala la misma CLI desde su release oficial y verifica el checksum SHA-256.
+  Escanea todo el historial con `.gitleaks.toml`, `--redact=100` y reporte JSON.
+  No descarga ni utiliza el artifact Docker.
+- La CLI usa normalmente el código 1 tanto para findings como para algunos
+  errores operativos. El reporte reserva `--exit-code=10` para findings y lo
+  normaliza a **1 informativo**; acepta únicamente 0/10 con JSON válido y conteo
+  coherente. Cualquier otro código, configuración inválida, descarga o checksum
+  fallido, o reporte inválido hace fallar el job. No se usa `continue-on-error`
+  ni `|| true` para tolerar errores.
+- La Action tiene comentarios, resumen y artifact automático desactivados, y
+  aplica redacción. El reporte publica sólo regla, ubicación, commit,
+  fingerprint y `Secret: REDACTED`; omite Match, Message y Fragment, que pueden
+  incluir texto sensible. El resumen muestra sólo el número de hallazgos y su
+  estado informativo. El JSON se publica como
+  `tp17-gitleaks-audit-${{ github.sha }}`, con retención de siete días.
+- `deploy-k8s-helm` exige éxito de build, ambos jobs Trivy y ambos jobs Gitleaks,
+  además de la comprobación existente de rama `main`. Sus comprobaciones de
+  credenciales y Kubernetes se mantienen.
+
+## Historial Git y hook local
+
+El hook observado ejecuta `gitleaks git --pre-commit --staged --config
+.gitleaks.toml --redact --verbose .`: examina el diff preparado en el índice
+antes de crear un commit. No audita por sí mismo todos los commits anteriores y
+se instala localmente; clonar el repositorio no instala automáticamente el hook.
+
+El análisis CI hace checkout completo y la comprobación CLI histórica recorre
+los commits de todos los refs disponibles (`--all`). Por eso también detecta un
+secreto agregado y borrado en commits diferentes, aunque ya no aparezca en el
+árbol actual. Las excepciones se evalúan mediante la misma configuración.
+
+## Comportamiento del pipeline
+
+| Estado | Reporte Gitleaks | Reporte Trivy | Publicación/deploy |
+|---|---|---|---|
+| Ambos Andon pasan | Se genera | Se genera si build pasó | Sólo en main y con ambos reportes exitosos |
+| Andon Gitleaks falla | Se ejecuta; findings informativos | Sigue su condición TP16 | Bloqueado |
+| Andon Trivy falla | Se ejecuta independientemente | Se genera si build pasó | Bloqueado |
+| Ambos Andon fallan | Se ejecuta | Se genera si build pasó | Bloqueado |
+| Build falla o se omite | Gitleaks sigue analizando Git | Se omite, según TP16 | Bloqueado |
+| Auditoría Gitleaks tiene error operativo | Job rojo; no publica JSON inválido | Independiente | Bloqueado |
+
+Los findings del reporte son informativos, pero el Andon Gitleaks sigue siendo
+bloqueante. Una ejecución verde del reporte no revierte un Andon rojo.
+Para repositorios de una organización, la Action requiere configurar el secret
+`GITLEAKS_LICENSE`; en una cuenta personal no se necesita. La Action recibe un
+token con permisos de lectura de contenido y PR para consultar los commits, sin
+habilitar comentarios.
+
+Referencias: [Gitleaks Action v3](https://github.com/gitleaks/gitleaks-action/tree/v3)
+y [Gitleaks CLI 8.30.0](https://github.com/gitleaks/gitleaks/tree/v8.30.0).
