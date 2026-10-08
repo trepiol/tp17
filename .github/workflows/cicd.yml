@@ -277,6 +277,22 @@ jobs:
           gitleaks git . --config "$GITLEAKS_CONFIG" --redact=100 \
             --log-opts=--all --exit-code=1 --no-banner
 
+      - name: Resumen seguro del Andon Gitleaks
+        if: ${{ always() }}
+        shell: bash
+        env:
+          TP17_ANDON_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### TP17 — Andon Cord Gitleaks"
+            echo
+            echo "Estado de los pasos previos: **${TP17_ANDON_STATUS}**."
+            echo "Gitleaks: **${GITLEAKS_VERSION}**; configuración: .gitleaks.toml."
+            echo "Un hallazgo no exceptuado o un error operativo bloquea publicación/deploy."
+            echo "Este resumen no modifica el resultado bloqueante ni muestra secretos."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   gitleaks-audit-report:
     name: TP17 — Auditoría histórica Gitleaks
     runs-on: ubuntu-24.04
@@ -381,7 +397,7 @@ jobs:
         with:
           name: tp17-gitleaks-audit-${{ github.sha }}
           path: ${{ runner.temp }}/tp17-gitleaks-audit/gitleaks-report.json
-          retention-days: 7
+          retention-days: 14
           if-no-files-found: error
 
   deploy-k8s-helm:
