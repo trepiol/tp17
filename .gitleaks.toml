@@ -1,0 +1,23 @@
+title = "TP17 - Gitleaks Secret Scanning"
+
+[extend]
+useDefault = true
+
+
+[[allowlists]]
+description = "Helm checksum/secret es un digest SHA-256, no una credencial"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^manifests-rendered-prod\.yaml$''']
+regexTarget = "line"
+regexes = ['''^\s*checksum/secret:\s*[0-9a-f]{64}\s*$''']
+
+
+[[allowlists]]
+description = "Secret sintetico historico del laboratorio TP09"
+targetRules = ["kubernetes-secret-yaml"]
+condition = "AND"
+commits = [
+  "dd6b5850ccf690c5489aeda43c566fc197987058"
+]
+paths = ['''^guia-09/manifests/db/secret\.yml$''']

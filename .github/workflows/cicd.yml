@@ -246,11 +246,176 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  gitleaks-andon-cord:
+    name: TP17 — Andon Cord Gitleaks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GITLEAKS_VERSION: "8.30.0"
+      GITLEAKS_CONFIG: .gitleaks.toml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detectar secretos en los commits del evento
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_SUMMARY: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+      # La Action limita push/PR al evento; este paso exige todo el historial.
+      - name: Verificar también el historial completo
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gitleaks version)" = "$GITLEAKS_VERSION"
+          test -s "$GITLEAKS_CONFIG"
+          gitleaks git . --config "$GITLEAKS_CONFIG" --redact=100 \
+            --log-opts=--all --exit-code=1 --no-banner
+
+      - name: Resumen seguro del Andon Gitleaks
+        if: ${{ always() }}
+        shell: bash
+        env:
+          TP17_ANDON_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### TP17 — Andon Cord Gitleaks"
+            echo
+            echo "Estado de los pasos previos: **${TP17_ANDON_STATUS}**."
+            echo "Gitleaks: **${GITLEAKS_VERSION}**; configuración: .gitleaks.toml."
+            echo "Un hallazgo no exceptuado o un error operativo bloquea publicación/deploy."
+            echo "Este resumen no modifica el resultado bloqueante ni muestra secretos."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gitleaks-audit-report:
+    name: TP17 — Auditoría histórica Gitleaks
+    runs-on: ubuntu-24.04
+    needs: [gitleaks-andon-cord]
+    if: ${{ always() }}
+    env:
+      GITLEAKS_VERSION: "8.30.0"
+      GITLEAKS_CONFIG: .gitleaks.toml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Instalar Gitleaks CLI con versión y checksum verificados
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/tp17-gitleaks-cli"
+          mkdir -p "$tool_dir"
+          cd "$tool_dir"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          checksums="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          release="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl --fail --silent --show-error --location --retry 3 \
+            "$release/$archive" -o "$archive"
+          curl --fail --silent --show-error --location --retry 3 \
+            "$release/$checksums" -o "$checksums"
+          sha256sum --check --ignore-missing "$checksums"
+          tar -xzf "$archive" gitleaks
+          chmod 755 gitleaks
+          test "$(./gitleaks version)" = "$GITLEAKS_VERSION"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+      - name: Auditar historial y generar JSON sin valores de secretos
+        id: audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gitleaks version)" = "$GITLEAKS_VERSION"
+          test -s "$GITLEAKS_CONFIG"
+          report_dir="$RUNNER_TEMP/tp17-gitleaks-audit"
+          mkdir -p "$report_dir"
+          trap 'rm -f "$report_dir/raw.json" "$report_dir/scan.log"' EXIT
+          # El código 1 también se usa en errores operativos de la CLI.
+          # Reservamos 10 para findings y lo normalizamos a 1 informativo.
+          if gitleaks git . --config "$GITLEAKS_CONFIG" --redact=100 \
+            --log-opts=--all --exit-code=10 --no-banner \
+            --report-format=json --report-path="$report_dir/raw.json" \
+            > "$report_dir/scan.log" 2>&1; then
+            status=0
+          else
+            status=$?
+          fi
+          case "$status" in
+            0) findings_status=0 ;;
+            10) findings_status=1 ;;
+            *)
+              echo "::error::Gitleaks no completó la auditoría (código $status)."
+              exit "$status"
+              ;;
+          esac
+          export TP17_REPORT_DIR="$report_dir"
+          export TP17_FINDINGS_STATUS="$findings_status"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_dir = Path(os.environ["TP17_REPORT_DIR"])
+          findings = json.loads((report_dir / "raw.json").read_text())
+          if not isinstance(findings, list) or any(
+              not isinstance(finding, dict) for finding in findings
+          ):
+              raise ValueError("Reporte Gitleaks inválido")
+          status = int(os.environ["TP17_FINDINGS_STATUS"])
+          if bool(findings) != bool(status):
+              raise ValueError("Código de findings inconsistente con el reporte")
+          # --redact oculta Secret, pero Message/Fragment pueden incluir texto.
+          # Publicamos sólo ubicaciones/reglas; ningún texto de código o commit.
+          fields = (
+              "RuleID", "File", "StartLine", "EndLine", "StartColumn",
+              "EndColumn", "Commit", "Fingerprint",
+          )
+          safe_findings = [
+              {**{key: finding[key] for key in fields if key in finding},
+               "Secret": "REDACTED"}
+              for finding in findings
+          ]
+          (report_dir / "gitleaks-report.json").write_text(
+              json.dumps(safe_findings, indent=2) + "\n"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  "### TP17 — Auditoría histórica Gitleaks\n\n"
+                  f"Hallazgos no exceptuados: **{len(findings)}**.\n\n"
+                  f"Código de hallazgos: **{status}** (informativo).\n"
+                  "El Andon Gitleaks controla el bloqueo del deploy.\n"
+              )
+          print(f"Auditoría completada: {len(findings)} hallazgos no exceptuados.")
+          PY
+      - name: Publicar reporte Gitleaks redactado
+        if: ${{ always() && steps.audit.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tp17-gitleaks-audit-${{ github.sha }}
+          path: ${{ runner.temp }}/tp17-gitleaks-audit/gitleaks-report.json
+          retention-days: 14
+          if-no-files-found: error
+
   deploy-k8s-helm:
     name: Fase 3 — Publicación y deploy Helm
     runs-on: ubuntu-24.04
-    needs: [build-and-package, trivy-andon-cord, trivy-audit-report]
-    if: ${{ github.ref == 'refs/heads/main' && needs.build-and-package.result == 'success' && needs.trivy-andon-cord.result == 'success' && needs.trivy-audit-report.result == 'success' }}
+    needs:
+      - build-and-package
+      - trivy-andon-cord
+      - trivy-audit-report
+      - gitleaks-andon-cord
+      - gitleaks-audit-report
+    if: >-
+      ${{ github.ref == 'refs/heads/main' &&
+          needs.build-and-package.result == 'success' &&
+          needs.trivy-andon-cord.result == 'success' &&
+          needs.trivy-audit-report.result == 'success' &&
+          needs.gitleaks-andon-cord.result == 'success' &&
+          needs.gitleaks-audit-report.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

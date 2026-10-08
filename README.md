@@ -332,3 +332,140 @@ yamllint -d relaxed .github/workflows/cicd.yml devops-tp12/values-prod.yaml
 | deploy-k8s-helm | Publicación y despliegue | — | Fallo real de deploy; omisión explícita si faltan credenciales | Publica/despliega la imagen ya construida | Resumen del job |
 
 V2: exigir los checks de estado mediante branch protection; fijar todas las Actions a SHA; mantener DB de Trivy cacheada; generar SBOM; hacer findings informativos accionables; versionar la imagen frontend; evaluar runner reproducible y agregar kube-state-metrics/autenticación instrumentada para completar las alertas TP12C.
+
+# TP17 — Detección de secretos con Gitleaks
+
+Gitleaks 8.30.0 se integra en el mismo pipeline con la configuración explícita
+`.gitleaks.toml`. Se conservan sus reglas por defecto y las dos excepciones
+específicas existentes; no se agrega baseline JSON ni nuevas excepciones.
+
+- `gitleaks-andon-cord` no depende del build ni de Trivy. Hace checkout con
+  `fetch-depth: 0`, usa `gitleaks/gitleaks-action@v3` y bloquea al detectar un
+  secreto o un error operativo. La Action escanea los commits del evento en
+  push/PR; un paso obligatorio con CLI y `--log-opts=--all` verifica además todo
+  el historial disponible. Se fija `GITLEAKS_VERSION: 8.30.0`.
+- `gitleaks-audit-report` depende sólo del Andon Gitleaks y usa `always()`.
+  Instala la misma CLI desde su release oficial y verifica el checksum SHA-256.
+  Escanea todo el historial con `.gitleaks.toml`, `--redact=100` y reporte JSON.
+  No descarga ni utiliza el artifact Docker.
+- La CLI usa normalmente el código 1 tanto para findings como para algunos
+  errores operativos. El reporte reserva `--exit-code=10` para findings y lo
+  normaliza a **1 informativo**; acepta únicamente 0/10 con JSON válido y conteo
+  coherente. Cualquier otro código, configuración inválida, descarga o checksum
+  fallido, o reporte inválido hace fallar el job. No se usa `continue-on-error`
+  ni `|| true` para tolerar errores.
+- La Action tiene comentarios, resumen automático y artifact automático desactivados, y
+  aplica redacción. El reporte publica sólo regla, ubicación, commit,
+  fingerprint y `Secret: REDACTED`; omite Match, Message y Fragment, que pueden
+  incluir texto sensible. El resumen muestra sólo el número de hallazgos y su
+  estado informativo. El JSON se publica como
+  `tp17-gitleaks-audit-${{ github.sha }}`, con retención de 14 días.
+  El Andon agrega un resumen propio con `always()` que muestra el estado de
+  los pasos previos, incluso ante fallos, sin cambiar su resultado bloqueante.
+- `deploy-k8s-helm` exige éxito de build, ambos jobs Trivy y ambos jobs Gitleaks,
+  además de la comprobación existente de rama `main`. Sus comprobaciones de
+  credenciales y Kubernetes se mantienen.
+
+## Historial Git y hook local
+
+El hook observado ejecuta `gitleaks git --pre-commit --staged --config
+.gitleaks.toml --redact --verbose .`: examina el diff preparado en el índice
+antes de crear un commit. No audita por sí mismo todos los commits anteriores y
+se instala localmente; clonar el repositorio no instala automáticamente el hook.
+
+El análisis CI hace checkout completo y la comprobación CLI histórica recorre
+los commits de todos los refs disponibles (`--all`). Por eso también detecta un
+secreto agregado y borrado en commits diferentes, aunque ya no aparezca en el
+árbol actual. Las excepciones se evalúan mediante la misma configuración.
+
+## Comportamiento del pipeline
+
+| Estado | Reporte Gitleaks | Reporte Trivy | Publicación/deploy |
+|---|---|---|---|
+| Ambos Andon pasan | Se genera | Se genera si build pasó | Sólo en main y con ambos reportes exitosos |
+| Andon Gitleaks falla | Se ejecuta; findings informativos | Sigue su condición TP16 | Bloqueado |
+| Andon Trivy falla | Se ejecuta independientemente | Se genera si build pasó | Bloqueado |
+| Ambos Andon fallan | Se ejecuta | Se genera si build pasó | Bloqueado |
+| Build falla o se omite | Gitleaks sigue analizando Git | Se omite, según TP16 | Bloqueado |
+| Auditoría Gitleaks tiene error operativo | Job rojo; no publica JSON inválido | Independiente | Bloqueado |
+
+Los findings del reporte son informativos, pero el Andon Gitleaks sigue siendo
+bloqueante. Una ejecución verde del reporte no revierte un Andon rojo.
+Para repositorios de una organización, la Action requiere configurar el secret
+`GITLEAKS_LICENSE`; en una cuenta personal no se necesita. La Action recibe un
+token con permisos de lectura de contenido y PR para consultar los commits, sin
+habilitar comentarios.
+
+Referencias: [Gitleaks Action v3](https://github.com/gitleaks/gitleaks-action/tree/v3)
+y [Gitleaks CLI 8.30.0](https://github.com/gitleaks/gitleaks/tree/v8.30.0).
+
+## Verificador local TP17
+
+Requisitos: Bash, Git, Gitleaks **8.30.0** y Python **3.11+** con PyYAML.
+Desde la raíz del repositorio:
+
+```bash
+bash -n scripts/verificar-gitleaks.sh
+bash scripts/verificar-gitleaks.sh
+```
+
+El script comprueba la versión exacta, la configuración TOML con
+`extend.useDefault = true`, la sintaxis YAML y la presencia de ambos jobs
+Gitleaks. Verifica que `.git/hooks/pre-commit` exista, sea ejecutable y pase
+`bash -n`; no ejecuta el hook ni sustituye su análisis del índice.
+
+Rechaza clones superficiales y recorre todo el historial de los refs locales
+con `gitleaks git . --config .gitleaks.toml --redact=100 --log-opts=--all`.
+Cualquier hallazgo no exceptuado o fallo operativo devuelve un código distinto
+de cero. La salida del escáner queda en un archivo temporal privado, eliminado
+al salir; el resumen muestra sólo verificaciones y estado. La cobertura
+histórica depende de los refs disponibles en el clon.
+
+## Matriz final de controles TP16 + TP17
+
+| Control | Alcance / dependencia | Resultado y evidencia |
+|---|---|---|
+| Hook local Gitleaks | Diff staged, antes del commit | Bloquea findings; instalación local, no se hereda al clonar |
+| Verificador TP17 | Versión, config, workflow, hook e historial local completo | Código 0 sólo si todas las verificaciones y el escaneo pasan |
+| Tests integrados TP12 | Aplicación devops-tp12 | Su éxito habilita build; lint TP06 se conserva independiente |
+| Build Once/Test Everywhere | Build único, depende de tests TP12 | Tarball Docker reutilizado por Trivy y deploy, retención 1 día |
+| Andon Trivy | Depende del build; SCA, imagen e IaC HIGH/CRITICAL | Bloqueante; lógica TP16 conservada |
+| Auditoría Trivy | Requiere build exitoso; corre aunque falle su Andon | LOW/MEDIUM informativos; artifacts JSON, 7 días |
+| Andon Gitleaks | Independiente de build/Trivy; commits del evento + historial completo | Bloqueante; resumen seguro con always(), incluso si un paso falla |
+| Auditoría Gitleaks | Depende sólo de su Andon y corre con always() | Findings informativos; errores operativos bloqueantes; JSON seguro, 14 días |
+| Publicación/deploy | main y éxito de build, ambos jobs Trivy y ambos Gitleaks | Conserva controles de credenciales y Kubernetes |
+| Semgrep | Workflow SAST existente | Se conserva sin cambios en este ajuste |
+
+## Pruebas reales de Gitleaks
+
+Pruebas locales realizadas en la VM con Gitleaks **8.30.0**, la configuración
+existente y redacción del 100 %:
+
+| Escenario | Ejecución y alcance real | Resultado |
+|---|---|---|
+| Positivo | Verificador sobre el historial completo de todos los refs locales, con las dos excepciones existentes | Código 0; 0 hallazgos no exceptuados |
+| Negativo | Archivo del commit histórico TP09 `dd6b5850ccf690c5489aeda43c566fc197987058`, ruta `guia-09/manifests/db/secret.yml`, reproducido temporalmente y analizado con `gitleaks dir` y la misma configuración | Código 1; 1 hallazgo de la regla `kubernetes-secret-yaml` |
+
+La prueba negativa reutiliza el secreto de laboratorio ya presente en el
+historial. El análisis del directorio temporal carece del commit original;
+por eso no cumple la excepción que exige simultáneamente commit y ruta.
+Demuestra la detección bloqueante de esa regla. El análisis histórico normal
+sí aplica la excepción específica existente. No se introdujeron nuevos
+secretos, commits ni excepciones; los archivos temporales se eliminaron.
+Estos resultados corresponden a ejecuciones locales, no a nuevos runs de
+GitHub Actions.
+
+## Tratamiento profesional de un secreto real
+
+1. **Revocar o rotar primero** la credencial en el servicio que la emitió y
+   revisar el alcance de su exposición.
+2. **Evaluar el purgado con git-filter-repo**: decidir si corresponde retirar
+   los datos del historial y planificar el impacto en hashes, firmas, ramas,
+   tags, clones, forks y referencias de PR.
+3. **Coordinar la actualización remota** con los responsables y colaboradores:
+   acordar las referencias a actualizar, los permisos y la sincronización o
+   recreación de clones para evitar reintroducir el historial anterior.
+
+Procedimiento basado en la [guía oficial de GitHub para eliminar datos sensibles](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository).
+En este cierre de TP17 sólo se documenta el procedimiento; no se revocan
+credenciales ni se ejecutan purgados o reescrituras del historial.
